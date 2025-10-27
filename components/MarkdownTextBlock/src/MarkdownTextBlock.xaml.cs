@@ -21,6 +21,14 @@ public partial class MarkdownTextBlock : Control
     private MyFlowDocument _document;
     private WinUIRenderer? _renderer;
 
+    // A small debounce delay to coalesce very fast updates (still available if you want to use it)
+    public TimeSpan UpdateDebounceDelayMs = TimeSpan.FromMilliseconds(200);
+
+    // Coalescing state: latest requested text and processing flag
+    private readonly object _updateLock = new();
+    private string? _latestText;
+    private bool _isProcessing;
+
     public event EventHandler<LinkClickedEventArgs>? OnLinkClicked;
 
     internal bool RaiseLinkClickedEvent(Uri uri)
@@ -46,7 +54,8 @@ public partial class MarkdownTextBlock : Control
     {
         if (d is MarkdownTextBlock self && e.NewValue != null)
         {
-            self.ApplyText(true);
+            // Fire-and-forget: publish request and let the coalescing loop handle sequencing
+            self.QueueUpdateText();
         }
     }
 
@@ -81,10 +90,7 @@ public partial class MarkdownTextBlock : Control
 
     private void ApplyConfig(MarkdownConfig config)
     {
-        if (_renderer != null)
-        {
-            _renderer.Config = config;
-        }
+        _renderer?.Config = config;
     }
 
     private void ApplyText(bool rerender)
@@ -141,6 +147,140 @@ public partial class MarkdownTextBlock : Control
             }
             _pipeline.Setup(_renderer);
             ApplyText(false);
+        }
+    }
+
+    /// <summary>
+    /// Publish latest text and start a single, coalescing processing loop if not already running.
+    /// The loop processes the first snapshot immediately and, after finishing, processes the latest snapshot
+    /// produced while the previous was running. Intermediate updates are coalesced to the latest.
+    /// This matches: A processed immediately; B/C ignored while A runs; then C processed; etc.
+    /// </summary>
+    private void QueueUpdateText()
+    {
+        lock (_updateLock)
+        {
+            _latestText = Text;
+            if (_isProcessing)
+            {
+                // already processing — the loop will pick up the new latest value when it finishes current iteration
+                return;
+            }
+            _isProcessing = true;
+        }
+
+        // Fire-and-forget the processing loop
+        _ = ProcessLoopAsync();
+    }
+
+    private async Task ProcessLoopAsync()
+    {
+        try
+        {
+            var firstIteration = true;
+
+            while (true)
+            {
+                string snapshot;
+                lock (_updateLock)
+                {
+                    snapshot = _latestText ?? string.Empty;
+                    _latestText = null; // claim it
+                }
+
+                // --- Debounce: skip on the very first iteration, apply on subsequent iterations ---
+                if (!firstIteration && UpdateDebounceDelayMs > TimeSpan.Zero)
+                {
+                    // Wait without capturing the synchronization context
+                    await Task.Delay(UpdateDebounceDelayMs).ConfigureAwait(false);
+
+                    // If newer text arrived during the delay, use the latest instead
+                    lock (_updateLock)
+                    {
+                        if (_latestText != null)
+                        {
+                            snapshot = _latestText;
+                            _latestText = null; // claim latest
+                        }
+                    }
+                }
+                // mark that we've done the first iteration (so future loops debounce)
+                firstIteration = false;
+                // -------------------------------------------------------------------------------
+
+                // If renderer/pipeline not ready, apply synchronously on UI thread and continue
+                if (_renderer == null || _pipeline == null)
+                {
+                    DispatcherQueue?.TryEnqueue(() => ApplyText(true));
+                }
+                else
+                {
+                    // Parse on background thread
+                    MarkdownDocument parsedMarkdown;
+                    try
+                    {
+                        parsedMarkdown = await Task.Run(() => Markdown.Parse(snapshot, _pipeline)).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // If parsing fails, swallow and continue to next snapshot (do not stop loop)
+                        parsedMarkdown = null!;
+                    }
+
+                    // Render on UI thread and wait till finished
+                    var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    DispatcherQueue?.TryEnqueue(() =>
+                    {
+                        try
+                        {
+                            if (parsedMarkdown != null)
+                            {
+                                MarkdownDocument = parsedMarkdown;
+                                _renderer.ReloadDocument();
+                                _renderer.Render(parsedMarkdown);
+                            }
+                            tcs.SetResult(true);
+                        }
+                        catch (Exception ex)
+                        {
+                            tcs.SetException(ex);
+                        }
+                    });
+
+                    // If DispatcherQueue was null and tcs never set, guard with a completed task
+                    if (tcs.Task.Status == TaskStatus.Created)
+                    {
+                        // No UI dispatch available; continue without waiting (best-effort)
+                        await Task.CompletedTask;
+                    }
+                    else
+                    {
+                        await tcs.Task.ConfigureAwait(false);
+                    }
+                }
+
+                // Let the runtime schedule any incoming QueueUpdateText calls
+                await Task.Yield();
+
+                // If no newer snapshot arrived while we were working, exit loop
+                lock (_updateLock)
+                {
+                    if (_latestText == null)
+                    {
+                        _isProcessing = false;
+                        break;
+                    }
+                    // else continue and process the latestText on next iteration
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Ensure processing flag cleared on unexpected error
+            lock (_updateLock)
+            {
+                _isProcessing = false;
+            }
         }
     }
 }
