@@ -18,6 +18,7 @@ internal class MyImage : IAddChild
     private HtmlNode? _htmlNode;
     private IImageProvider? _imageProvider;
     private ISVGRenderer _svgRenderer;
+    private MarkdownThemes _themes;
     private double _precedentWidth;
     private double _precedentHeight;
     private bool _loaded;
@@ -33,6 +34,7 @@ internal class MyImage : IAddChild
         _uri = uri;
         _imageProvider = config.ImageProvider;
         _svgRenderer = config.SVGRenderer == null ? new DefaultSVGRenderer() : config.SVGRenderer;
+        _themes = config.Themes;
         Init();
         var size = Extensions.GetMarkdownImageSize(linkInline);
         if (size.Width != 0)
@@ -55,6 +57,7 @@ internal class MyImage : IAddChild
         _htmlNode = htmlNode;
         _imageProvider = config?.ImageProvider;
         _svgRenderer = config?.SVGRenderer == null ? new DefaultSVGRenderer() : config.SVGRenderer;
+        _themes = config?.Themes ?? MarkdownThemes.Default;
         Init();
         int.TryParse(
             htmlNode.GetAttribute("width", "0"),
@@ -89,10 +92,31 @@ internal class MyImage : IAddChild
         if (_loaded) return;
         try
         {
+            // Track whether we have valid natural dimensions to constrain against
+            bool hasNaturalWidth = false;
+            bool hasNaturalHeight = false;
+
             if (_imageProvider != null && _imageProvider.ShouldUseThisProvider(_uri.AbsoluteUri))
             {
                 _image = await _imageProvider.GetImage(_uri.AbsoluteUri);
                 _container.Child = _image;
+                
+                // Capture natural dimensions as max constraints from the provider image
+                // Then clear fixed Width/Height so images can shrink responsively
+                if (_image.Width > 0 && !double.IsNaN(_image.Width) && !double.IsInfinity(_image.Width))
+                {
+                    _image.MaxWidth = _image.Width;
+                    _image.Width = double.NaN; // Clear fixed width to allow shrinking
+                    hasNaturalWidth = true;
+                }
+                if (_image.Height > 0 && !double.IsNaN(_image.Height) && !double.IsInfinity(_image.Height))
+                {
+                    _image.MaxHeight = _image.Height;
+                    _image.Height = double.NaN; // Clear fixed height to allow shrinking
+                    hasNaturalHeight = true;
+                }
+                
+                _loaded = true;
             }
             else
             {
@@ -134,34 +158,51 @@ internal class MyImage : IAddChild
                         await bitmap.SetSourceAsync(stream);
                     }
                     _image.Source = bitmap;
-                    _image.Width = bitmap.PixelWidth == 0 ? bitmap.DecodePixelWidth : bitmap.PixelWidth;
-                    _image.Height = bitmap.PixelHeight == 0 ? bitmap.DecodePixelHeight : bitmap.PixelHeight;
+                    // Don't set fixed Width/Height - let layout system handle it
+                    // Store natural dimensions for MaxWidth/MaxHeight constraints
+                    double naturalWidth = bitmap.PixelWidth == 0 ? bitmap.DecodePixelWidth : bitmap.PixelWidth;
+                    double naturalHeight = bitmap.PixelHeight == 0 ? bitmap.DecodePixelHeight : bitmap.PixelHeight;
 
+                    // Use natural size as max constraint so image doesn't upscale
+                    if (naturalWidth > 0)
+                    {
+                        _image.MaxWidth = naturalWidth;
+                        hasNaturalWidth = true;
+                    }
+                    if (naturalHeight > 0)
+                    {
+                        _image.MaxHeight = naturalHeight;
+                        hasNaturalHeight = true;
+                    }
                 }
 
                 _loaded = true;
             }
 
+            // Apply precedent (markdown-specified) dimensions if provided
+            // Precedent always takes priority and sets a known dimension
             if (_precedentWidth != 0)
             {
-                _image.Width = _precedentWidth;
+                _image.MaxWidth = _precedentWidth;
+                hasNaturalWidth = true;
             }
             if (_precedentHeight != 0)
             {
-                _image.Height = _precedentHeight;
+                _image.MaxHeight = _precedentHeight;
+                hasNaturalHeight = true;
             }
 
-            // Apply theme constraints if provided
-            var themes = MarkdownConfig.Default.Themes;
-            if (themes.ImageMaxWidth > 0)
+            // Apply theme constraints - only if we have a known dimension to constrain
+            // This prevents theme constraints from enlarging images with unknown natural size
+            if (_themes.ImageMaxWidth > 0 && hasNaturalWidth && _themes.ImageMaxWidth < _image.MaxWidth)
             {
-                _image.MaxWidth = themes.ImageMaxWidth;
+                _image.MaxWidth = _themes.ImageMaxWidth;
             }
-            if (themes.ImageMaxHeight > 0)
+            if (_themes.ImageMaxHeight > 0 && hasNaturalHeight && _themes.ImageMaxHeight < _image.MaxHeight)
             {
-                _image.MaxHeight = themes.ImageMaxHeight;
+                _image.MaxHeight = _themes.ImageMaxHeight;
             }
-            _image.Stretch = themes.ImageStretch;
+            _image.Stretch = _themes.ImageStretch;
         }
         catch (Exception) { }
     }
